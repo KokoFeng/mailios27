@@ -7,6 +7,7 @@ import android.net.Uri
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -110,18 +111,22 @@ class MailVM(private val app: Application) : AndroidViewModel(app) {
     fun updateShine(x: Float) { glassShine = x; ui.edit().putFloat("shine", x).apply() }
 
     // ---------- Profile photos ----------
+    // Compose state is only written on the main thread; background work just returns its result.
     private fun avatarFile(email: String) = java.io.File(app.filesDir, "avatar_" + email.lowercase().hashCode() + ".png")
 
     private fun loadAvatars() {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val m = mutableMapOf<String, ImageBitmap>()
-                Vault.all(app).forEach { acc ->
-                    val f = avatarFile(acc.email)
-                    if (f.exists()) BitmapFactory.decodeFile(f.path)?.let { m[acc.email] = it.asImageBitmap() }
-                }
-                avatars = m
-            } catch (e: Exception) { }
+        viewModelScope.launch {
+            val found = withContext(Dispatchers.IO) {
+                val r = mutableMapOf<String, android.graphics.Bitmap>()
+                try {
+                    Vault.all(app).forEach { acc ->
+                        val f = avatarFile(acc.email)
+                        if (f.exists()) BitmapFactory.decodeFile(f.path)?.let { r[acc.email] = it }
+                    }
+                } catch (e: Exception) { }
+                r
+            }
+            avatars = found.mapValues { it.value.asImageBitmap() }
         }
     }
 
@@ -131,24 +136,27 @@ class MailVM(private val app: Application) : AndroidViewModel(app) {
         return android.graphics.Bitmap.createScaledBitmap(cropped, 384, 384, true)
     }
 
-    private fun storeAvatar(email: String, bmp: android.graphics.Bitmap) {
+    private fun saveAvatarFile(email: String, bmp: android.graphics.Bitmap): android.graphics.Bitmap {
         val sq = squareOf(bmp)
         avatarFile(email).outputStream().use { sq.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
-        avatars = avatars + (email to sq.asImageBitmap())
+        return sq
     }
 
     fun chooseAvatar(uri: String) {
         val a = account ?: return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             try {
-                val cr = app.contentResolver
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                cr.openInputStream(Uri.parse(uri))?.use { BitmapFactory.decodeStream(it, null, bounds) }
-                var s = 1
-                while (bounds.outWidth / s > 1200 || bounds.outHeight / s > 1200) s *= 2
-                val opts = BitmapFactory.Options().apply { inSampleSize = s }
-                val bmp = cr.openInputStream(Uri.parse(uri))?.use { BitmapFactory.decodeStream(it, null, opts) }
-                if (bmp != null) storeAvatar(a.email, bmp)
+                val sq = withContext(Dispatchers.IO) {
+                    val cr = app.contentResolver
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    cr.openInputStream(Uri.parse(uri))?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                    var s = 1
+                    while (bounds.outWidth / s > 1200 || bounds.outHeight / s > 1200) s *= 2
+                    val opts = BitmapFactory.Options().apply { inSampleSize = s }
+                    val bmp = cr.openInputStream(Uri.parse(uri))?.use { BitmapFactory.decodeStream(it, null, opts) }
+                    if (bmp == null) null else saveAvatarFile(a.email, bmp)
+                }
+                if (sq != null) avatars = avatars + (a.email to sq.asImageBitmap())
             } catch (e: Exception) { toast = "!Couldn't use that photo" }
         }
     }
@@ -162,18 +170,23 @@ class MailVM(private val app: Application) : AndroidViewModel(app) {
     // Looks up a public profile photo for the address (Gravatar). Google does not expose its photo to mail apps.
     private fun detectGravatar(a: Account) {
         if (avatarFile(a.email).exists()) return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             try {
-                val md = java.security.MessageDigest.getInstance("MD5")
-                val hash = md.digest(a.email.trim().lowercase().toByteArray()).joinToString("") { "%02x".format(it) }
-                val conn = java.net.URL("https://www.gravatar.com/avatar/$hash?s=384&d=404").openConnection() as java.net.HttpURLConnection
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
-                if (conn.responseCode == 200) {
-                    val bmp = conn.inputStream.use { BitmapFactory.decodeStream(it) }
-                    if (bmp != null) storeAvatar(a.email, bmp)
+                val sq = withContext(Dispatchers.IO) {
+                    val md = java.security.MessageDigest.getInstance("MD5")
+                    val hash = md.digest(a.email.trim().lowercase().toByteArray()).joinToString("") { "%02x".format(it) }
+                    val conn = java.net.URL("https://www.gravatar.com/avatar/$hash?s=384&d=404").openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 8000
+                    conn.readTimeout = 8000
+                    var out: android.graphics.Bitmap? = null
+                    if (conn.responseCode == 200) {
+                        val bmp = conn.inputStream.use { BitmapFactory.decodeStream(it) }
+                        if (bmp != null) out = saveAvatarFile(a.email, bmp)
+                    }
+                    conn.disconnect()
+                    out
                 }
-                conn.disconnect()
+                if (sq != null) avatars = avatars + (a.email to sq.asImageBitmap())
             } catch (e: Exception) { }
         }
     }
@@ -189,17 +202,19 @@ class MailVM(private val app: Application) : AndroidViewModel(app) {
     private fun loadWallpaper() {
         val u = wallpaperUri
         if (u == null) { wallpaper = null; return }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val cr = app.contentResolver
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                cr.openInputStream(Uri.parse(u))?.use { BitmapFactory.decodeStream(it, null, bounds) }
-                var s = 1
-                while (bounds.outWidth / s > 1400 || bounds.outHeight / s > 1400) s *= 2
-                val opts = BitmapFactory.Options().apply { inSampleSize = s }
-                val bmp = cr.openInputStream(Uri.parse(u))?.use { BitmapFactory.decodeStream(it, null, opts) }
-                wallpaper = bmp?.asImageBitmap()
-            } catch (e: Exception) { wallpaper = null }
+        viewModelScope.launch {
+            val bmp = withContext(Dispatchers.IO) {
+                try {
+                    val cr = app.contentResolver
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    cr.openInputStream(Uri.parse(u))?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                    var s = 1
+                    while (bounds.outWidth / s > 1400 || bounds.outHeight / s > 1400) s *= 2
+                    val opts = BitmapFactory.Options().apply { inSampleSize = s }
+                    cr.openInputStream(Uri.parse(u))?.use { BitmapFactory.decodeStream(it, null, opts) }
+                } catch (e: Exception) { null }
+            }
+            wallpaper = bmp?.asImageBitmap()
         }
     }
 
@@ -323,12 +338,15 @@ class MailVM(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 MailClient.previews(a, path, uids) { batch ->
-                    items = items.map {
-                        val p = batch[it.uid]
-                        if (p == null) it else it.copy(
-                            preview = p,
-                            category = MailClient.categorize(it.fromAddr, it.subject, p, it.category == Category.Promotions)
-                        )
+                    // the callback runs on a background thread: apply the result on the main thread
+                    viewModelScope.launch {
+                        items = items.map {
+                            val p = batch[it.uid]
+                            if (p == null) it else it.copy(
+                                preview = p,
+                                category = MailClient.categorize(it.fromAddr, it.subject, p, it.category == Category.Promotions)
+                            )
+                        }
                     }
                 }
                 if (query.isBlank()) Cache.save(app, a.email, path, items)

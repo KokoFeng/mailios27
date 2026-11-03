@@ -53,6 +53,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun begin(savedInstanceState: Bundle?) {
+        vm.theme // create the ViewModel here, outside any composition
         if (savedInstanceState == null) handle(intent)
         setContent {
             val sys = isSystemInDarkTheme()
